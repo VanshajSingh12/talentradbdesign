@@ -1,0 +1,1238 @@
+-- =============================================================================
+-- Talentra Database Design ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã¯Â¿Â½ Documentation module
+-- Decision notes, integration boundaries (Section 6), compliance register (Section 5).
+--
+-- This file records decisions and compliance evidence required by the docket.
+-- It does NOT add new schema objects. It is commentary/justification only.
+-- =============================================================================
+
+/* ============================================================================
+ * B1 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã¯Â¿Â½ DB PROVIDER DECISION (PostgreSQL)
+ * ============================================================================
+ * Decision: PostgreSQL.
+ *
+ * Reason (as required by B1):
+ *  1. The docket allows PostgreSQL or MySQL. We choose PostgreSQL because the schema
+ *     uses features that are cleaner in PostgreSQL and that the docket explicitly
+ *     references as "where the engine supports it":
+ *       - Exclusion constraints for non-overlapping subscription periods (Rule Group 10).
+ *       - Partial indexes for hot-path query patterns (e.g. active session counting,
+ *         active shortlist/bookmark rows, active device/session rows).
+ *       - CHECK constraints with regex for E.164 phone validation, boolean flag defaults,
+ *         and date-range checks.
+ *       - TIMESTAMPTZ for UTC timestamps with source timezone recorded where it matters
+ *         (Rule Group 3 timestamp domain).
+ *       - NUMERIC(15,2) for money (Rule Group 3 money domain) without floating point.
+ *  2. The docket says "Reserved keywords for the chosen engine must not be used as
+ *     identifiers. Participants must check the engine's reserved word list for both
+ *     MySQL and PostgreSQL where the design targets both."
+ *     Our design targets PostgreSQL primarily; where a column/table name could collide
+ *     with a reserved word in either engine, we avoided it. We checked PostgreSQL 16
+ *     reserved words for every identifier. If the platform later targets MySQL too,
+ *     a reserved-word cross-check against MySQL 8.0 reserved words must be run. We do
+ *     not claim dual-engine readiness without that check.
+ *  3. Session/credential handling, audit append-only, and device-limit counting are
+ *     implemented with PostgreSQL features (partial indexes, CHECK, exclusion constraints)
+ *     that are well supported.
+ *
+ * If the team later decides MySQL is required, the following would need review:
+ *   - Exclusion constraint for subscription periods (would need an alternate approach,
+ *     e.g. application-enforced non-overlap + a unique functional index or a trigger).
+ *   - Partial index usage patterns (supported in MySQL 8.0 but with different syntax/limits).
+ *   - Reserved word list differences (e.g. "rank", "system", "key", "order", "group",
+ *     "user", "limit", "select", "index", "table", "column", "primary", "references",
+ *     "check", "unique", "view", "trigger", "procedure", "function", "database",
+ *     "date", "time", "timestamp", "boolean", "text", "blob", "enum", "set", "json",
+ *     "geometry", "point", "linestring", "polygon", "multipoint", "multilinestring",
+ *     "multipolygon", "geometrycollection", "mediumint", "tinyint", "smallint", "bigint",
+ *     "decimal", "numeric", "float", "double", "real", "signed", "unsigned", "zerofill",
+ *     "binary", "varbinary", "char", "varchar", "national", "character", "varying",
+ *     "integer", "int", "year", "datetime", "timestamp", "time", "date", "month",
+ *     "day", "hour", "minute", "second", " microsecond", "period", "fourth", "minute",
+ *     "hour", "day", "week", "month", "quarter", "year", "minute", "second", "microsecond",
+ *     "over", "partition", "parameters", "partial", "password", "path", "plan", "post",
+ *     "preview", "privileges", "procedure", "process", "profile", "program", "query",
+ *     "range", "rank", "read", "reads", "real", "reassign", "recheck", "references",
+ *     "regexp", "relative", "release", "reload", "rename", "repeat", "repeatable",
+ *     "replace", "requires", "reset", "resignal", "resource", "restore", "restrict",
+ *     "return", "returns", "revoke", "right", "role", "rollback", "rollup", "routine",
+ *     "row", "rows", "savepoint", "schema", "schemas", "scope", "scroll", "search",
+ *     "secondary", "security", "select", "sensitive", "separator", "sequence", "serial",
+ *     "server", "session", "session_user", "set", "share", "show", "signal", "signed",
+ *     "skip", "slave", "smallint", "snapshot", "socket", "some", "soname", "spatial",
+ *     "specific", "sql", "sql_big_result", "sql_buffer_result", "sql_cache", "sql_calc_found_rows",
+ *     "sql_no_cache", "sql_small_result", "sqlexception", "sqlstate", "sqlwarning", "ssl",
+ *     "starting", "stats", "status", "storage", "straight_join", "string", "strip",
+ *     "subclass_origin", "substring", "success", "summary", "super", "supervisor",
+ *     "system", "table", "tables", "tablespace", "temp", "temporary", "terminated",
+ *     "text", "than", "then", "time", "timestamp", "timeout", "tinyint", "to", "trailing",
+ *     "transaction", "trigger", "truncate", "trusted", "type", "uncommit", "union",
+ *     "unique", "unlock", "unsigned", "update", "usage", "use", "user", "using",
+ *     "utc_tmestamp", "value", "variables", "varying", "view", "warnings", "week",
+ *     "weight", "when", "window", "with", "without", "work", "wrapper", "write",
+ *     "x509", "xml", "xor", "year", "zerofill", "zone", "and many more).
+ *   - Data type mapping (e.g. BOOLEAN -> TINYINT(1) in MySQL; TEXT length semantics;
+ *     INET type not available in MySQL; use VARCHAR + check).
+ *   - TIMESTAMPTZ -> TIMESTAMP with timezone handling in application.
+ *   - CITEXT -> VARCHAR + check for lowercase.
+ *   - ARRAY types (e.g. TEXT[]) not available in MySQL; use JSON or separate table.
+ *   - JSONB -> JSON.
+ *   - RETURNING clauses, ON CONFLICT handling, UPSERT syntax differences.
+ *   - Function/trigger syntax differences.
+ *
+ * This file records the decision and the reason. It does not change the DDL.
+ * ============================================================================ */
+
+/* ============================================================================
+ * GIG MODEL DECISION (Section 2 Gig Work; your choice: share core model)
+ * ============================================================================
+ * Decision: gigs share the core job + application model with other job types.
+ *
+ * Justification (as required by Section 2):
+ *  1. Reporting: a shared job/application model lets us run unified pipeline, source,
+ *     employer, candidate, and search KPIs without maintaining two parallel job models.
+ *     The analytics layer can treat gig requests as jobs with gig-specific attributes.
+ *  2. Integrity: the core application uniqueness rule (one application per candidate per
+ *     job), pipeline event history, questionnaire attachment, and publish state all apply
+ *     to gig requests without duplication. Foreign keys and constraints are shared.
+ *  3. Future change: gig-specific fields are separated into gig_request_detail and the
+ *     gig marketplace module (availability, applications, assignments, handoff references,
+ *     earnings references, favourites, blacklists, ratings). The core job table stays
+ *     generic. Adding a new job type later only means adding a companion detail table and
+ *     a flag, not a new job table.
+ *  4. Trade-off: the downside is that the core job table carries a few gig-related
+ *     concepts (e.g. is_open_to_consultants is used for both consultant sourcing and gig
+ *     openness in the shared model; gig-specific openness can be mirrored in gig_request_detail
+ *     where needed). This is acceptable because the docket says consultant openness and gig
+ *     openness are both part of the job lifecycle, and the shared model keeps a single source
+ *     of truth for the job status/pipeline.
+ *  5. The alternative (separate subsystem) would duplicate job posting, application, pipeline,
+ *     questionnaire, and publish state logic for gigs, increasing maintenance and risking
+ *     inconsistent reporting. Given the docket emphasis on unified pipeline reporting and
+ *     analytics, the shared model is the better fit.
+ *
+ * Implementation:
+ *   - A gig request is a job_requirement row (with gig-related openness/context) plus a
+ *     gig_request_detail row for gig-specific pricing, windows, and handoff/fulfillment context.
+ *   - Gig worker profiles are separate from candidate_identity, as the docket says gig workers
+ *     have a separate profile from permanent and temporary candidates.
+ *   - Gig applications, assignments, handoff references, earnings references, favourites,
+ *     blacklists, and ratings are in the gig marketplace module (06_gig_marketplace.sql).
+ *   - The core application pipeline, questionnaire attachment, and publish state remain in the
+ *     Jobs and Applications module (03_jobs_applications.sql).
+ *
+ * This file records the decision and justification. It does not change the DDL.
+ * ============================================================================ */
+
+/* ============================================================================
+ * CREDENTIAL MODELLING DECISION (Administration module, Section 4 Tier 1 credentials)
+ * ============================================================================
+ * Decision: separate credential_verification + credential_recovery tables.
+ *
+ * Justification (industry best practice, as requested):
+ *  1. Credential material (password verifier, federated identity references, recovery
+ *     tokens) should be separated from the user identity row so that:
+ *     - credential lifecycle (reset, lockout, recovery, multi-credential support) is
+ *       auditable and extensible without changing the user table.
+ *     - the user table stays focused on identity/profile data.
+ *     - credential material handling (hashing, tokenisation, masking, rotation) is
+ *       localized to the credential tables and the security design note.
+ *  2. credential_verification stores credential type, status, last used, lockout/failure
+ *     counters, locked_until, and recovery references. Credential material is stored as
+ *     hashed/tokenised/masked per the security design note; cleartext secrets are NOT
+ *     stored in the DDL.
+ *  3. credential_recovery stores recovery event records and token references for account
+ *     recovery flows, as references/anchors, not raw secrets.
+ *  4. The user table keeps email (lowercase, unique), phone (E.164), and profile fields
+ *     as identity data, with sensitive classification where applicable.
+ *
+ * This matches best practice for credential verification and recovery while staying within
+ * the docket credential domain (Section 4 Tier 1: users, credentials, roles, sessions,
+ * consent records).
+ *
+ * This file records the decision and justification. It does not change the DDL.
+ * ============================================================================ */
+
+/* ============================================================================
+ * INTEGRATION BOUNDARIES (Section 6)
+ * ============================================================================
+ * The docket requires a table documenting, for each external boundary:
+ *   - Data ownership: which system is the source of truth
+ *   - Stored vs. referenced data
+ *   - Failure behaviour: what the platform does when the external system is down
+ *   - Idempotency: how duplicate events are prevented
+ *   - Audit: how the exchange is recorded
+ *
+ * Below is that table, in docket order.
+ * ============================================================================ */
+
+/*
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Boundary             | Data Ownership  | Stored vs.        | Failure       | Idempotency   | Audit         |
+  |                      |                 | Referenced        | Behaviour     |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Payment gateway      | Participant     | Stores transaction| Participant   | Participant   | Participant   |
+  |                      | decision        | references, status| decision      | decision      | decision      |
+  |                      |                 | and amounts. Does |               |               |               |
+  |                      |                 | not store card or |               |               |               |
+  |                      |                 | bank data.        |               |               |               |
+  |                      |                 | Stored: order      |               |               |               |
+  |                      |                 | number, status,    |               |               |               |
+  |                      |                 | amount, currency,  |               |               |               |
+  |                      |                 | gateway reference, |               |               |               |
+  |                      |                 | minimal gateway    |               |               |               |
+  |                      |                 | response for audit,|               |               |               |
+  |                      |                 | initiated/completed|               |               |               |
+  |                      |                 | /failed timestamps,|               |               |               |
+  |                      |                 | payer/user ref.    |               |               |               |
+  |                      |                 | Referenced: card/  |               |               |               |
+  |                      |                 | bank data is not   |               |               |               |
+  |                      |                 | stored.           |               |               |               |
+  |                      |                 | Failure: payment   |               |               |               |
+  |                      |                 | order status moves |               |               |               |
+  |                      |                 | to failed; retry   |               |               |               |
+  |                      |                 | policy applied;    |               |               |               |
+  |                      |                 | user notified; no  |               |               |               |
+  |                      |                 | partial state      |               |               |               |
+  |                      |                 | committed.         |               |               |               |
+  |                      |                 | Idempotency: order |               |               |               |
+  |                      |                 | number unique;      |               |               |               |
+  |                      |                 | gateway reference   |               |               |               |
+  |                      |                 | unique; duplicate   |               |               |               |
+  |                      |                 | initiation prevented|               |               |               |
+  |                      |                 | by application.     |               |               |               |
+  |                      |                 | Audit: payment     |               |               |               |
+  |                      |                 | order + payment    |               |               |               |
+  |                      |                 | status history +   |               |               |               |
+  |                      |                 | wallet ledger entry|               |               |               |
+  |                      |                 | record the exchange|               |               |               |
+  |                      |                 | and outcome.        |               |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Identity verification| Participant     | Stores verification| Participant   | Participant   | Participant   |
+  | service              | decision        | outcome and a      | decision      | decision      | decision      |
+  | (national identity   |                 | token. Does not    |               |               |               |
+  | checks)              |                 | store raw identity |               |               |               |
+  |                      |                 | numbers in clear   |               |               |               |
+  |                      |                 | text.             |               |               |               |
+  |                      |                 | Stored: verification|               |               |               |
+  |                      |                 | outcome, token      |               |               |               |
+  |                      |                 | reference, outcome |               |               |               |
+  |                      |                 | timestamp, actor.   |               |               |               |
+  |                      |                 | Referenced: raw     |               |               |               |
+  |                      |                 | identity numbers    |               |               |               |
+  |                      |                 | not stored in clear|               |               |               |
+  |                      |                 | (tokenised/masked   |               |               |               |
+  |                      |                 | per security note). |               |               |               |
+  |                      |                 | Failure: verification|               |               |               |
+  |                      |                 | status set to       |               |               |               |
+  |                      |                 | pending/failed;     |               |               |               |
+  |                      |                 | candidate flagged;  |               |               |               |
+  |                      |                 | no partial identity |               |               |               |
+  |                      |                 | state committed.    |               |               |               |
+  |                      |                 | Idempotency:        |               |               |               |
+  |                      |                 | verification request|               |               |               |
+  |                      |                 | keyed by candidate  |               |               |               |
+  |                      |                 | + service + request |               |               |               |
+  |                      |                 | id; duplicate       |               |               |               |
+  |                      |                 | submissions         |               |               |               |
+  |                      |                 | prevented by        |               |               |               |
+  |                      |                 | application.        |               |               |               |
+  |                      |                 | Audit: verification |               |               |               |
+  |                      |                 | status record +     |               |               |               |
+  |                      |                 | audit_event record  |               |               |               |
+  |                      |                 | the exchange and    |               |               |               |
+  |                      |                 | outcome.            |               |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Company registration | Participant     | Stores verification | Participant   | Participant   | Participant   |
+  | and tax verification | decision        | status and the      | decision      | decision      | decision      |
+  |                      |                 | identifiers used    |               |               |               |
+  |                      |                 | for verification    |               |               |               |
+  |                      |                 | lookup.            |               |               |               |
+  |                      |                 | Stored: identifier  |               |               |               |
+  |                      |                 | value as text with  |               |               |               |
+  |                      |                 | country + type code,|               |               |               |
+  |                      |                 | masked/display form,|               |               |               |
+  |                      |                 | verification status,|               |               |               |
+  |                      |                 | verified_at, actor. |               |               |               |
+  |                      |                 | Referenced: raw     |               |               |               |
+  |                      |                 | national ID numbers |               |               |               |
+  |                      |                 | not stored in clear |               |               |               |
+  |                      |                 | where avoidable     |               |               |               |
+  |                      |                 | (tokenised/masked   |               |               |               |
+  |                      |                 | per security note). |               |               |               |
+  |                      |                 | Failure: verification|               |               |               |
+  |                      |                 | status set to       |               |               |               |
+  |                      |                 | pending/failed;     |               |               |               |
+  |                      |                 | employer flagged;   |               |               |               |
+  |                      |                 | no partial company  |               |               |               |
+  |                      |                 | state committed.    |               |               |               |
+  |                      |                 | Idempotency:        |               |               |               |
+  |                      |                 | verification request|               |               |               |
+  |                      |                 | keyed by organisation|               |               |               |
+  |                      |                 | + service + request |               |               |               |
+  |                      |                 | id; duplicate       |               |               |               |
+  |                      |                 | submissions         |               |               |               |
+  |                      |                 | prevented by        |               |               |               |
+  |                      |                 | application.        |               |               |               |
+  |                      |                 | Audit: verification |               |               |               |
+  |                      |                 | status record +     |               |               |               |
+  |                      |                 | audit_event record  |               |               |               |
+  |                      |                 | the exchange and    |               |               |               |
+  |                      |                 | outcome.            |               |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Gig fulfilment       | Participant     | Stores the handoff  | Participant   | Participant   | Participant   |
+  | system               | decision        | reference,          | decision      | decision      | decision      |
+  |                      |                 | assignment status,  |               |               |               |
+  |                      |                 | and reconciled       |               |               |               |
+  |                      |                 | earnings. Does not  |               |               |               |
+  |                      |                 | run fulfilment.     |               |               |               |
+  |                      |                 | Stored: handoff     |               |               |               |
+  |                      |                 | reference, external  |               |               |               |
+  |                      |                 | reference, handoff   |               |               |               |
+  |                      |                 | status, fulfillment  |               |               |               |
+  |                      |                 | status, synced_at,   |               |               |               |
+  |                      |                 | reconciled earnings  |               |               |               |
+  |                      |                 | references.          |               |               |               |
+  |                      |                 | Referenced: external |               |               |               |
+  |                      |                 | fulfillment state is |               |               |               |
+  |                      |                 | referenced, not run |               |               |               |
+  |                      |                 | by the platform.     |               |               |               |
+  |                      |                 | Failure: handoff/   |               |               |               |
+  |                      |                 | fulfillment status   |               |               |               |
+  |                      |                 | set to pending/failed|               |               |               |
+  |                      |                 | ; retry/reconciliation|               |               |               |
+  |                      |                 | policy applied; no  |               |               |               |
+  |                      |                 | partial assignment   |               |               |               |
+  |                      |                 | state committed.     |               |               |               |
+  |                      |                 | Idempotency: handoff |               |               |               |
+  |                      |                 | reference unique per |               |               |               |
+  |                      |                 | assignment; duplicate|               |               |               |
+  |                      |                 | handoff prevented by |               |               |               |
+  |                      |                 | application.         |               |               |               |
+  |                      |                 | Audit: gig_handoff_ |               |               |               |
+  |                      |                 | reference + gig_     |               |               |               |
+  |                      |                 | earnings_reference + |               |               |               |
+  |                      |                 | audit_event record   |               |               |               |
+  |                      |                 | the exchange and     |               |               |               |
+  |                      |                 | outcome.             |               |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Legacy job and       | Participant     | Source of migration | Participant   | Participant   | Participant   |
+  | candidate systems    | decision        | and periodic sync.  | decision      | decision      | decision      |
+  |                      |                 | Participants must   |               |               |               |
+  |                      |                 | define sync direction|               |               |               |
+  |                      |                 | for each field and  |               |               |               |
+  |                      |                 | conflict rule.      |               |               |               |
+  |                      |                 | Stored: legacy source|               |               |               |
+  |                      |                 | record identifiers   |               |               |               |
+  |                      |                 | (e.g. legacy_org_id, |               |               |               |
+  |                      |                 | source_record_       |               |               |               |
+  |                      |                 | external_id) as      |               |               |               |
+  |                      |                 | unique constraints,  |               |               |               |
+  |                      |                 | not primary keys;    |               |               |               |
+  |                      |                 | sync metadata.       |               |               |               |
+  |                      |                 | Referenced: legacy   |               |               |               |
+  |                      |                 | system is the source|               |               |               |
+  |                      |                 | of truth for legacy  |               |               |               |
+  |                      |                 | records; platform    |               |               |               |
+  |                      |                 | owns the merged      |               |               |               |
+  |                      |                 | representation.      |               |               |               |
+  |                      |                 | Failure: sync status |               |               |               |
+  |                      |                 | set to pending/failed|               |               |               |
+  |                      |                 | ; conflict rule      |               |               |               |
+  |                      |                 | applied per field;   |               |               |               |
+  |                      |                 | no partial sync      |               |               |               |
+  |                      |                 | state committed.     |               |               |               |
+  |                      |                 | Idempotency: sync   |               |               |               |
+  |                      |                 | by legacy record id |               |               |               |
+  |                      |                 | + sync batch id;     |               |               |               |
+  |                      |                 | duplicate sync       |               |               |               |
+  |                      |                 | prevented by         |               |               |               |
+  |                      |                 | application.         |               |               |               |
+  |                      |                 | Audit: sync status  |               |               |               |
+  |                      |                 | + audit_event record |               |               |               |
+  |                      |                 | the exchange and     |               |               |               |
+  |                      |                 | outcome.             |               |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Messaging and        | Participant     | Stores delivery      | Participant   | Participant   | Participant   |
+  | notification         | decision        | status and           | decision      | decision      | decision      |
+  | providers (email,    |                 | preferences. Does    |               |               |               |
+  | SMS, messaging app)  |                 | not store message   |               |               |               |
+  |                      |                 | bodies longer than   |               |               |               |
+  |                      |                 | required for audit. |               |               |               |
+  |                      |                 | Stored: delivery     |               |               |               |
+  |                      |                 | status, delivery      |               |               |               |
+  |                      |                 | reference, channel,  |               |               |               |
+  |                      |                 | scheduled/sent/       |               |               |               |
+  |                      |                 | delivered/read        |               |               |               |
+  |                      |                 | timestamps, error.   |               |               |               |
+  |                      |                 | Referenced: message  |               |               |               |
+  |                      |                 | body not stored      |               |               |               |
+  |                      |                 | longer than required |               |               |               |
+  |                      |                 | for audit; subject/  |               |               |               |
+  |                      |                 | minimal body stored  |               |               |               |
+  |                      |                 | for audit where       |               |               |               |
+  |                      |                 | needed.              |               |               |               |
+  |                      |                 | Failure: delivery    |               |               |               |
+  |                      |                 | status set to failed;|               |               |               |
+  |                      |                 | retry policy applied;|               |               |               |
+  |                      |                 | no partial delivery  |               |               |               |
+  |                      |                 | state committed.     |               |               |               |
+  |                      |                 | Idempotency: delivery|               |               |               |
+  |                      |                 | keyed by recipient + |               |               |               |
+  |                      |                 | notification type +  |               |               |               |
+  |                      |                 | channel + scheduled   |               |               |               |
+  |                      |                 | time; duplicate       |               |               |               |
+  |                      |                 | deliveries prevented |               |               |               |
+  |                      |                 | by application.       |               |               |               |
+  |                      |                 | Audit: notification_ |               |               |               |
+  |                      |                 | delivery record +    |               |               |               |
+  |                      |                 | audit_event record   |               |               |               |
+  |                      |                 | the exchange and     |               |               |               |
+  |                      |                 | outcome.             |               |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Social sharing       | Participant     | Outbound links only. | Participant   | Participant   | Participant   |
+  |                      | decision        | Stores share events, | decision      | decision      | decision      |
+  |                      |                 | not the external     |               |               |               |
+  |                      |                 | post content.        |               |               |               |
+  |                      |                 | Stored: share event  |               |               |               |
+  |                      |                 | record (actor, target,|               |               |               |
+  |                      |                 | timestamp, share      |               |               |               |
+  |                      |                 | reference).           |               |               |               |
+  |                      |                 | Referenced: external |               |               |               |
+  |                      |                 | post content not      |               |               |               |
+  |                      |                 | stored.              |               |               |               |
+  |                      |                 | Failure: share event |               |               |               |
+  |                      |                 | recorded as attempted|               |               |               |
+  |                      |                 | ; no partial share   |               |               |               |
+  |                      |                 | state committed.     |               |               |               |
+  |                      |                 | Idempotency: share   |               |               |               |
+  |                      |                 | event keyed by actor |               |               |               |
+  |                      |                 | + target + share ref;|               |               |               |
+  |                      |                 | duplicate shares     |               |               |               |
+  |                      |                 | prevented by         |               |               |               |
+  |                      |                 | application.         |               |               |               |
+  |                      |                 | Audit: share event   |               |               |               |
+  |                      |                 | record + audit_event |               |               |               |
+  |                      |                 | record the exchange  |               |               |               |
+  |                      |                 | and outcome.         |               |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Mapping and          | Participant     | Stores coordinates    | Participant   | Participant   | Participant   |
+  | geolocation service  | decision        | and place references. | decision      | decision      | decision      |
+  |                      |                 | Treat as optional.   |               |               |               |
+  |                      |                 | Stored: coordinates   |               |               |               |
+  |                      |                 | (lat/long) with       |               |               |               |
+  |                      |                 | precision + source;  |               |               |               |
+  |                      |                 | place reference.      |               |               |               |
+  |                      |                 | Referenced: external |               |               |               |
+  |                      |                 | geolocation service   |               |               |               |
+  |                      |                 | is the source of      |               |               |               |
+  |                      |                 | truth for coordinates |               |               |               |
+  |                      |                 | where used; platform  |               |               |               |
+  |                      |                 | stores the reference. |               |               |               |
+  |                      |                 | Failure: coordinates |               |               |               |
+  |                      |                 | left null (unknown);  |               |               |               |
+  |                      |                 | no partial location   |               |               |               |
+  |                      |                 | state committed.      |               |               |               |
+  |                      |                 | Idempotency: place    |               |               |               |
+  |                      |                 | reference keyed by    |               |               |               |
+  |                      |                 | entity + place ref;   |               |               |               |
+  |                      |                 | duplicate place refs  |               |               |               |
+  |                      |                 | prevented by          |               |               |               |
+  |                      |                 | application.          |               |               |               |
+  |                      |                 | Audit: coordinate/    |               |               |               |
+  |                      |                 | place reference note  |               |               |               |
+  |                      |                 | + audit_event record  |               |               |               |
+  |                      |                 | the exchange and      |               |               |               |
+  |                      |                 | outcome.              |               |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+  | Company review and   | Participant     | Reference only, with   | Participant   | Participant   | Participant   |
+  | salary data          | decision        | source attribution and  | decision      | decision      | decision      |
+  |                      |                 | refresh date.           |               |               |               |
+  |                      |                 | Stored: benchmark/rating|               |               |               |
+  |                      |                 | data with source name,  |               |               |               |
+  |                      |                 | source URL, refresh     |               |               |               |
+  |                      |                 | date (Tier 3 stretch    |               |               |               |
+  |                      |                 | module).                |               |               |               |
+  |                      |                 | Referenced: external    |               |               |               |
+  |                      |                 | company review and      |               |               |               |
+  |                      |                 | salary data is the      |               |               |               |
+  |                      |                 | source of truth for     |               |               |               |
+  |                      |                 | those values; platform  |               |               |               |
+  |                      |                 | stores a reference      |               |               |               |
+  |                      |                 | copy with attribution.   |               |               |               |
+  |                      |                 | Failure: benchmark/     |               |               |               |
+  |                      |                 | rating data left as     |               |               |               |
+  |                      |                 | last known good or      |               |               |               |
+  |                      |                 | null; refresh deferred; |               |               |               |
+  |                      |                 | no partial data         |               |               |               |
+  |                      |                 | committed.              |               |               |               |
+  |                      |                 | Idempotency: benchmark/ |               |               |               |
+  |                      |                 | rating record keyed by   |               |               |               |
+  |                      |                 | natural key + source +   |               |               |               |
+  |                      |                 | refresh; duplicate       |               |               |               |
+  |                      |                 | refresh prevented by      |               |               |               |
+  |                      |                 | application.              |               |               |               |
+  |                      |                 | Audit: refresh log +     |               |               |               |
+  |                      |                 | audit_event record the   |               |               |               |
+  |                      |                 | exchange and outcome.    |               |               |               |
+  +----------------------+-----------------+-------------------+---------------+---------------+---------------+
+ */
+
+/* ============================================================================
+ * RULE GROUP 1-10 COMPLIANCE REGISTER (Section 5)
+
+-- ============================================================================
+-- SECTION: MILESTONE-ORDER ENTITIES -> RELATIONSHIPS -> COLUMNS (CONTEXT MENU)
+-- ============================================================================
+-- Approach: entities first, then cardinality between entities, then key columns,
+-- in the docket milestone order. This is the "context menu" for the schema:
+--   * Milestone 1 (Common): start at Master Data / Administration / Profile
+--   * Milestone 2 (Candidate Profile): 02_profile.sql
+--   * Milestone 3 (Employer / Org): 05_organisation.sql
+--   * Milestone 4 (Jobs & Applications): 03_jobs_applications.sql
+--   * Milestone 5 (Gig Marketplace): 06_gig_marketplace.sql
+--   * Milestone 6 (Licences/Seats/Devices): 07_licences.sql
+--   * Milestone 7 (Sourcing & Consultant): 08_sourcing.sql
+--   * Milestone 8 (Subscriptions/Wallet): 09_subscriptions.sql
+--   * Milestone 9 (Notifications/Prefs/Community): 10_notifications.sql
+--   * Milestone 10 (Analytics): 11_analytics.sql
+--   * Milestone 11 (Shared Team Items): 04_administration.sql (blocking, audit, consent, sessions)
+--   * Milestone 12 (Tier 3 stretch): 12_tier3_stretch.sql
+--
+-- Read order for implementation: Domain table -> extension table -> transaction table -> audit/history.
+
+CREATE TABLE schema_map_milestone_order (
+    row_order         SMALLINT NOT NULL,
+    milestone         TEXT     NOT NULL,
+    module           TEXT     NOT NULL,
+    entity           TEXT     NOT NULL,
+    relationship     TEXT     NOT NULL,
+    key_columns      TEXT     NOT NULL,
+    primary_kpi_or_rule TEXT   NULL,
+    quiet_comment    TEXT     NULL,
+    CONSTRAINT uq_schema_map_row UNIQUE (row_order, entity)
+);
+
+INSERT INTO schema_map_milestone_order (row_order, milestone, module, entity, relationship, key_columns, primary_kpi_or_rule, quiet_comment) VALUES
+-- Milestone 1 (Common start): Master Data
+(1 , 'Milestone 1 (Common)', '01_master_data.sql', 'country',
+   'country 1..* state; country 1..* city; state 1..* city (state_id nullable for non-state territories)',
+   'id PK, iso_alpha2, iso_alpha3, iso_numeric, name, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'B8/B9 reference-data completeness',
+   'Public master data.'),
+(2 , 'Milestone 1 (Common)', '01_master_data.sql', 'state',
+   'country 1..* state. Referenced by city.',
+   'id PK, country_id FK, name, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'B8/B9',
+   ''),
+(3 , 'Milestone 1 (Common)', '01_master_data.sql', 'city',
+   'country 1..* city; state 1..* city. Referenced by transaction modules.',
+   'id PK, country_id FK, state_id FK (nullable), name, latitude, longitude, coordinates_source, timezone, is_active, created_at, created_by, updated_at, updated_by',
+   'B8/B9 location coverage',
+   'coordinates nullable only when unknown; source stored per Rule Group 3.'),
+(4 , 'Milestone 1 (Common)', '01_master_data.sql', 'skill',
+   'skill 1..* candidate_skill; skill 1..* job_requirement_skill; skill 1..* skill_ancestor; skill 1..* skill_synonym',
+   'id PK, name, category, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'B12 skill normalization',
+   'Unique differentiator: taxonomy (skill_ancestor) + synonyms (skill_synonym) added.'),
+(5 , 'Milestone 1 (Common)', '01_master_data.sql', 'skill_ancestor',
+   'skill 1..* skill_ancestor (ancestor); skill 1..* skill_ancestor (descendant)',
+   'id PK, ancestor_skill_id FK, descendant_skill_id FK, ancestry_type_code, created_at, created_by',
+   'Skill affinity pipeline',
+   'Unique: explicit skill ancestry for normalization/merge.'),
+(6 , 'Milestone 1 (Common)', '01_master_data.sql', 'skill_synonym',
+   'skill 1..* skill_synonym',
+   'id PK, skill_id FK, synonym_text, language_code (nullable), is_active, created_at, created_by',
+   'Multilingual skill matching',
+   'Unique: multilingual skill synonyms.'),
+(7 , 'Milestone 1 (Common)', '01_master_data.sql', 'tag_category',
+   'tag_category 1..* tag',
+   'id PK, category_code, name, is_active, created_at, created_by',
+   'Flexible tagging',
+   'Unique master: tag taxonomy for candidates and jobs.'),
+(8 , 'Milestone 1 (Common)', '01_master_data.sql', 'tag',
+   'tag_category 1..* tag; tag 1..* candidate_tag; tag 1..* job_requirement_tag; tag 1..* application_tag',
+   'id PK, tag_category_id FK (nullable), name, language_code (nullable), is_active, created_at, created_by',
+   'Tagging cross-module',
+   'Unique: shared tag master reused by Profile, Jobs, Applications.'),
+(9 , 'Milestone 1 (Common)', '01_master_data.sql', 'qualification',
+   'reference_code (domain=education_level) 1..* qualification.education_level_code',
+   'id PK, code, name, education_level_code FK, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'B8/B9',
+   'Education level uses single reference_code pattern (Rule Group 3).'),
+(10, 'Milestone 1 (Common)', '01_master_data.sql', 'industry',
+   'industry 1..* organisation_industry_classification (future extension)',
+   'id PK, name, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'B8/B9 industry coverage',
+   ''),
+(11, 'Milestone 1 (Common)', '01_master_data.sql', 'job_role',
+   'job_role 1..* job_position.job_role_code (if used) and job requirement metadata',
+   'id PK, name, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'B13 role standardization',
+   ''),
+(12, 'Milestone 1 (Common)', '01_master_data.sql', 'employment_type',
+   'Standalone master referenced by job_requirement.employment_type_code',
+   'id PK, code, display_name_key, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'B13',
+   'Enum lookup pattern (Rule Group 3).'),
+(13, 'Milestone 1 (Common)', '01_master_data.sql', 'work_type',
+   'Standalone master referenced by job_requirement.work_type_code',
+   'id PK, code, display_name_key, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'B13',
+   'Enum lookup pattern (Rule Group 3).'),
+(14, 'Milestone 1 (Common)', '01_master_data.sql', 'language_lookup',
+   'language_lookup 1..* ui_translation; language_lookup 1..* candidate_language (via name where modelled)',
+   'id PK, iso_639_1, iso_639_3, name, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'B7 multilingual',
+   'Reserved-name issue: table is language_lookup.'),
+(15, 'Milestone 1 (Common)', '01_master_data.sql', 'reference_code',
+   'reference_code 1..* (qualification, employment_type, assessment_type, application_stage, etc.) via (domain, code)',
+   'id PK, domain, code, display_name_key, is_active, sort_order, created_at, created_by, updated_at, updated_by',
+   'Rule Group 3 enum rule',
+   'Single enum lookup for all enums.'),
+(16, 'Milestone 1 (Common)', '01_master_data.sql', 'ui_translation',
+   'language_lookup 1..* ui_translation',
+   'id PK, ui_key, language_id FK, value, is_default, created_at, created_by, updated_at, updated_by',
+   'Rule Group 7',
+   'Multilingual UI strings with default-language fallback.'),
+
+-- Milestone 2: Profile
+(17, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_identity',
+   'candidate_identity 1..1 users (optional); 1..* candidate_contact/education/work_experience/skill/language/resume_version/profile_project/assessment/course_enrolment/scoring/activity; 1..* candidate_tag; 1..* candidate_skill_affinity',
+   'id PK, user_id FK (nullable), title, first_name, middle_name, last_name, preferred_name, date_of_birth, gender, profile_status_code, profile_completion_score, latest_login_at, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Tier 1 + all Tier 2',
+   'Profile identity core.'),
+(18, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_contact',
+   'candidate_identity 1..* candidate_contact',
+   'id PK, candidate_id FK, contact_type_code, email, phone, phone_country_code, address_line1, address_line2, city, state, country, postal_code, is_primary, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Personal + contact master',
+   'Unique: full contact detail model; email/phone classified sensitive.'),
+(19, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_education',
+   'candidate_identity 1..* candidate_education',
+   'id PK, candidate_id FK, institution_name, qualification, field_of_study, start_date, end_date, is_current, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Education history',
+   'Date nullability + ongoing flag.'),
+(20, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_work_experience',
+   'candidate_identity 1..* candidate_work_experience',
+   'id PK, candidate_id FK, employer_name, role, start_date, end_date, is_current, location_city, location_country, description, salary_min, salary_max, salary_currency_code, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Work history',
+   'Money domain with salary range + currency.'),
+(21, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_skill',
+   'candidate_identity 1..* candidate_skill',
+   'id PK, candidate_id FK, skill_name, proficiency, years_of_experience, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Skill profile',
+   'Distinct from master skill; free text skill name supports real-world variation.'),
+(22, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_language',
+   'candidate_identity 1..* candidate_language',
+   'id PK, candidate_id FK, language_name, proficiency, is_native, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Language profile',
+   ''),
+(23, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'resume_template',
+   'resume_template 1..* resume_version.template_id',
+   'id PK, name, template_body_ref, is_active, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Tier 2',
+   'Body in object storage (ref), not in-db.'),
+(24, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'resume_version',
+   'candidate_identity 1..* resume_version; resume_template 1..* resume_version (optional)',
+   'id PK, candidate_id FK, template_id FK (nullable), resume_body, language (nullable), version_label, is_current, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Tier 2',
+   'Only unbounded TEXT here (resume body).'),
+(25, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'profile_project',
+   'candidate_identity 1..* profile_project; gig_project_details 1..* profile_project (where gig)',
+   'id PK, candidate_id FK, project_type_code, project_name, role, start_date, end_date, is_current, duration_months, outcome, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Tier 1/2 projects',
+   'Candidate + gig projects in one table, type-coded.'),
+(26, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'assessment',
+   'candidate_identity 1..* assessment',
+   'id PK, candidate_id FK, assessment_type_code, score, max_score, taken_at, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Tier 2 assessments',
+   'Score bounded to max_score.'),
+(27, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'course_enrolment',
+   'candidate_identity 1..* course_enrolment',
+   'id PK, candidate_id FK, course_name, enrolled_at, completed_at (nullable), status_code, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Tier 2',
+   ''),
+(28, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'profile_completion_score',
+   'candidate_identity 1..* profile_completion_score (one current via partial unique)',
+   'id PK, candidate_id FK, score, evaluated_at, is_current, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Completion KPI',
+   ''),
+(29, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'profile_view_history',
+   'users 1..* profile_view_history (viewer); candidate_identity 1..* profile_view_history (viewed)',
+   'id PK, viewer_id FK, candidate_id FK, viewed_at',
+   'Profile engagement',
+   'Append-only.'),
+(30, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_activity_log',
+   'candidate_identity 1..* candidate_activity_log',
+   'id PK, candidate_id FK, activity_type_code, occurred_at, detail',
+   'Activity stream',
+   'Append-only.'),
+(31, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_shortlist_entry',
+   'users 1..* candidate_shortlist_entry (owner); candidate_identity 1..* candidate_shortlist_entry; candidate_shortlist_entry 1..* candidate_shortlist_history',
+   'id PK, shortlist_owner_id FK, candidate_id FK, list_name, is_public, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Shortlist engagement',
+   ''),
+(32, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_shortlist_history',
+   'users 1..* candidate_shortlist_history (owner); candidate_identity 1..* candidate_shortlist_history; candidate_shortlist_entry 1..* candidate_shortlist_history',
+   'id PK, shortlist_owner_id FK, candidate_id FK, action_code, occurred_at',
+   'Shortlist history',
+   'Append-only.'),
+(33, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'referral_tracking',
+   'candidate_identity 1..* referral_tracking (referrer); candidate_identity 1..* referral_tracking (referred, nullable); job_requirement 1..* referral_tracking (nullable)',
+   'id PK, referrer_candidate_id FK, referred_candidate_id FK (nullable), job_id FK (nullable), referred_at, status_code, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Referral funnel',
+   ''),
+(34, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_skill_affinity',
+   'candidate_identity 1..* candidate_skill_affinity (one current via partial unique)',
+   'id PK, candidate_id FK, snapshot_at, overall_affinity, top_skill_names, top_skill_count, is_current, created_at, created_by, updated_at, updated_by',
+   'Unique skill-affinity KPI',
+   'Unique: computed skill affinity snapshot.'),
+(35, 'Milestone 2 (Candidate Profile)', '02_profile.sql', 'candidate_tag',
+   'candidate_identity 1..* candidate_tag; tag 1..* candidate_tag',
+   'id PK, candidate_id FK, tag_id FK, created_at, created_by',
+   'Unique tagging',
+   'Unique: flexible candidate tags.'),
+
+-- Milestone 3: Employer / Org
+(36, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'tenant_account',
+   'tenant_account 1..* account_status_history; tenant_account 1..* organisation_hierarchy (children); tenant_account 1..* employer_organisation; tenant_account 1..* recruiter_mapping; tenant_account 1..* account_administrator; tenant_account 1..* account_security_policy',
+   'id PK, external_tenant_id, account_code, name, contact_email, status_code, created_at, created_by, updated_at, updated_by',
+   'Tenant account',
+   'Tenant/account anchor for multi-tenancy.'),
+(37, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'account_status_history',
+   'tenant_account 1..* account_status_history',
+   'id PK, tenant_account_id FK, status_code, effective_from, effective_to (nullable), recorded_at, recorded_by_user_id (nullable)',
+   'Account lifecycle',
+   'Effective-dated status history.'),
+(38, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'organisation_hierarchy',
+   'employer_organisation 1..* organisation_hierarchy (children); employer_organisation 1..* organisation_hierarchy (parent)',
+   'id PK, parent_organisation_id FK (nullable), child_organisation_id FK, relationship_type_code, is_active, created_at, created_by, updated_at, updated_by',
+   'Org hierarchy',
+   'Hierarchical org structure.'),
+(39, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'employer_organisation',
+   'tenant_account 1..* employer_organisation; employer_organisation 1..* company_location; employer_organisation 1..* tax_registration_identifier; employer_organisation 1..* verification_status_record; employer_organisation 1..* organisation_industry_classification; employer_organisation 1..* organisation_competitor_intel; employer_organisation 1..* recruiter_mapping',
+   'id PK, tenant_account_id FK, organisation_code, name, legal_name, other_names, website, status_code, created_at, created_by, updated_at, updated_by',
+   'Employer organisation',
+   'Employer profile anchor.'),
+(40, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'company_location',
+   'employer_organisation 1..* company_location; city 1..* company_location (via city_id)',
+   'id PK, employer_organisation_id FK, city_id FK (nullable), name, address_line1, address_line2, postal_code, is_primary, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Office locations',
+   'City master linkage.'),
+(41, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'tax_registration_identifier',
+   'employer_organisation 1..* tax_registration_identifier; country 1..* tax_registration_identifier (via country_code)',
+   'id PK, employer_organisation_id FK, country_code, tax_id_code, tax_id_number, is_primary, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Compliance data',
+   'Country code + tax id per jurisdiction.'),
+(42, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'verification_status_record',
+   'employer_organisation 1..* verification_status_record',
+   'id PK, employer_organisation_id FK, verification_category_code, status_code, detail, verified_by_user_id (nullable), verified_at (nullable), created_at, created_by, updated_at, updated_by',
+   'KYC/verification',
+   'Verification lifecycle.'),
+(43, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'recruiter_mapping',
+   'employer_organisation 1..* recruiter_mapping (organisations); users 1..* recruiter_mapping (recruiters); tenant_account 1..* recruiter_mapping (account)',
+   'id PK, tenant_account_id FK, employer_organisation_id FK, recruiter_user_id FK, mapping_type_code, is_primary, effective_from, effective_to (nullable), created_at, created_by, updated_at, updated_by',
+   'B34 effective-dated recruiter mapping',
+   'Effective-dated many-to-many recruiter-org mapping.'),
+(44, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'account_administrator',
+   'tenant_account 1..* account_administrator; users 1..* account_administrator',
+   'id PK, tenant_account_id FK, user_id FK, role_assignment_id FK (nullable), is_removed, created_at, created_by, updated_at, updated_by',
+   'Admin assignment',
+   ''),
+(45, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'organisation_industry_classification',
+   'employer_organisation 1..* organisation_industry_classification; industry 1..* organisation_industry_classification; reference_code (classification_type) 1..* organisation_industry_classification',
+   'id PK, employer_organisation_id FK, industry_id FK, classification_type_code FK, is_primary, created_at, created_by, updated_at, updated_by',
+   'Unique multi-industry classification',
+   'Unique: an org can carry multiple industry tags.'),
+(46, 'Milestone 3 (Employer / Org)', '05_organisation.sql', 'organisation_competitor_intel',
+   'employer_organisation 1..* organisation_competitor_intel',
+   'id PK, employer_organisation_id FK, source_system_code, external_reference, rating_value, review_count, salary_benchmark_code, refreshed_at, is_active, created_at, created_by, updated_at, updated_by',
+   'Unique competitor intel linkage',
+   'Unique: ties employer to company-review/salary boundary data (Section 6).'),
+
+-- Milestone 4: Jobs & Applications
+(47, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'job_requirement',
+   'employer_organisation 1..* job_requirement; job_requirement 1..* job_position; job_requirement 1..* job_requirement_skill; job_requirement 1..* job_requirement_tag; job_requirement 1..* job_requirement_requirement; job_requirement 1..* job_questionnaire; job_requirement 1..* application; job_requirement 1..* application_denial_code; job_requirement 1..* referral_tracking (nullable)',
+   'id PK, tenant_account_id FK, employer_organisation_id FK, job_code, title, description, employment_type_code, work_type_code, location_city_id (nullable), location_country_id (nullable), salary_min, salary_max, salary_currency_code, status_code, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Job posting lifecycle',
+   'Job requirement core.'),
+(48, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'job_position',
+   'job_requirement 1..* job_position',
+   'id PK, job_requirement_id FK, position_title, min_salary, max_salary, salary_currency_code, headcount, deadline_at (nullable), created_at, created_by, updated_at, updated_by, deleted_at',
+   'Position-level detail',
+   'Position breakdown of a job requirement.'),
+(49, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'job_requirement_skill',
+   'job_requirement 1..* job_requirement_skill; skill 1..* job_requirement_skill',
+   'id PK, job_requirement_id FK, skill_name, proficiency, is_required, created_at, created_by, updated_at, updated_by',
+   'Skill requirements',
+   'Matches candidate_skill for matching.'),
+(50, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'job_requirement_tag',
+   'job_requirement 1..* job_requirement_tag; tag 1..* job_requirement_tag',
+   'id PK, job_requirement_id FK, tag_id FK, created_at, created_by',
+   'Unique job tagging',
+   'Unique: tags on jobs.'),
+(51, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'job_requirement_requirement',
+   'job_requirement 1..* job_requirement_requirement (parent); job_requirement 1..* job_requirement_requirement (child)',
+   'id PK, job_requirement_id FK, source_requirement_id FK (nullable), requirement_type_code, requirement_text, is_active, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Requirement hierarchy',
+   'Nested requirement tree.'),
+(52, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'job_questionnaire',
+   'job_requirement 1..* job_questionnaire',
+   'id PK, job_requirement_id FK, questionnaire_title, is_required, created_at, created_by, updated_at, updated_by',
+   'Questionnaire attachment',
+   ''),
+(53, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'job_questionnaire_question',
+   'job_questionnaire 1..* job_questionnaire_question',
+   'id PK, job_questionnaire_id FK, question_order, question_text, answer_type_code, created_at, created_by',
+   'Questionnaire content',
+   ''),
+(54, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'job_publish_state',
+   'job_requirement 1..* job_publish_state',
+   'id PK, job_requirement_id FK, state_code, effective_from, effective_to (nullable), published_by_user_id (nullable), created_at',
+   'Publish state',
+   'Effective-dated publish state.'),
+(55, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'application',
+   'job_requirement 1..* application; candidate_identity 1..* application; users 1..* application (applicant)',
+   'id PK, job_requirement_id FK, candidate_id FK, applicant_user_id FK (nullable), status_code, applied_at, stage_history, created_at, created_by, updated_at, updated_by',
+   'Application pipeline',
+   'Candidate <-> job application core.'),
+(56, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'application_pipeline_event',
+   'application 1..* application_pipeline_event; users 1..* application_pipeline_event (actor)',
+   'id PK, application_id FK, actor_user_id FK (nullable), event_type_code, new_stage_code, detail, occurred_at',
+   'Pipeline event stream',
+   'Auditable pipeline transitions.'),
+(57, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'candidate_job_search_history',
+   'candidate_identity 1..* candidate_job_search_history',
+   'id PK, candidate_id FK, search_criteria, search_count, created_at',
+   'Job search behaviour',
+   'Tier 2.'),
+(58, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'candidate_application_history',
+   'candidate_identity 1..* candidate_application_history; job_requirement 1..* candidate_application_history',
+   'id PK, candidate_id FK, job_requirement_id FK, applied_at, status_code, created_at, updated_at',
+   'Application history',
+   'Tier 2.'),
+(59, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'application_tag',
+   'application 1..* application_tag; tag 1..* application_tag',
+   'id PK, application_id FK, tag_id FK, created_at, created_by',
+   'Unique application tagging',
+   'Unique: tags on applications.'),
+(60, 'Milestone 4 (Jobs & Applications)', '03_jobs_applications.sql', 'application_denial_code',
+   'application 1..* application_denial_code; reference_code (stage) 1..* application_denial_code (stage_code); users 1..* application_denial_code (recorded_by)',
+   'id PK, application_id FK, stage_code FK, denial_code, reason_text (nullable), recorded_at, recorded_by_user_id (nullable)',
+   'Unique denial-code analytics',
+   'Unique: structured rejection reason codes.'),
+
+-- Milestone 5: Gig Marketplace
+(61, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_request_detail',
+   'job_requirement 1..1 gig_request_detail (via job_requirement_id FK, natural 1..1)',
+   'id PK, job_requirement_id FK (unique), gig_type_code, scope_description, delivery_deadline_at, estimated_duration_hours, budget_min, budget_max, budget_currency_code, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Shared-core gig extension',
+   'Gig specifics; shares core job model (your decision).'),
+(62, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_worker_profile',
+   'candidate_identity 1..1 gig_worker_profile',
+   'id PK, candidate_id FK (unique), work_categories, hourly_rate_min, hourly_rate_max, currency_code, created_at, created_by, updated_at, updated_by',
+   'Gig worker profile',
+   'Worker-facing gig profile.'),
+(63, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_worker_availability',
+   'gig_worker_profile 1..* gig_worker_availability',
+   'id PK, gig_worker_profile_id FK, available_from, available_to (nullable), slots_json, created_at, created_by, updated_at, updated_by',
+   'Worker availability',
+   'Availability windows.'),
+(64, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_application',
+   'job_requirement 1..* gig_application; gig_worker_profile 1..* gig_application',
+   'id PK, job_requirement_id FK, gig_worker_profile_id FK, status_code, bid_amount, bid_currency_code, proposal_text, created_at, created_by, updated_at, updated_by',
+   'Gig application',
+   'Gig-specific application flow.'),
+(65, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_assignment',
+   'gig_request_detail 1..* gig_assignment; gig_worker_profile 1..* gig_assignment; users 1..* gig_assignment (assigned_by)',
+   'id PK, gig_request_detail_id FK, gig_worker_profile_id FK, assigned_by_user_id (nullable), status_code, started_at (nullable), completed_at (nullable), created_at, created_by, updated_at, updated_by',
+   'Gig assignment lifecycle',
+   ''),
+(66, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_handoff_reference',
+   'gig_assignment 1..* gig_handoff_reference',
+   'id PK, gig_assignment_id FK, handoff_to_user_id, handoff_at, reason_text, created_at, created_by',
+   'Gig handoffs',
+   'Handoff tracking.'),
+(67, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_earnings_reference',
+   'gig_assignment 1..* gig_earnings_reference',
+   'id PK, gig_assignment_id FK, payer_user_id (nullable), amount, currency_code, breakdown_json, created_at, created_by',
+   'Gig earnings record',
+   'Earnings ledger reference.'),
+(68, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_favourite',
+   'gig_request_detail 1..* gig_favourite; gig_worker_profile 1..* gig_favourite',
+   'id PK, gig_request_detail_id FK, gig_worker_profile_id FK, created_at',
+   'Favourites',
+   'Worker favourites.'),
+(69, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_blacklist',
+   'job_requirement 1..* gig_blacklist; gig_worker_profile 1..* gig_blacklist; users 1..* gig_blacklist (by)',
+   'id PK, job_requirement_id FK, gig_worker_profile_id FK, added_by_user_id (nullable), reason_text, created_at',
+   'Blacklist',
+   'Worker blacklisting per job.'),
+(70, 'Milestone 5 (Gig Marketplace)', '06_gig_marketplace.sql', 'gig_rating',
+   'job_requirement 1..* gig_rating; gig_worker_profile 1..* gig_rating; users 1..* gig_rating (rating_by)',
+   'id PK, job_requirement_id FK, gig_worker_profile_id FK, rating_by_user_id (nullable), rating_value, comment_text, created_at, created_by',
+   'Gig ratings',
+   'B35 non-overlap considered in gig worker window logic.'),
+
+-- Milestone 6: Licences / Seats / Devices / Sessions
+(71, 'Milestone 6 (Licences/Seats/Devices)', '07_licences.sql', 'subscription_licence',
+   'tenant_account 1..* subscription_licence; subscription_plan 1..* subscription_licence (via plan_code only if vendor-managed)',
+   'id PK, tenant_account_id FK, licence_key, plan_code, max_users, max_devices_per_user, issued_at, expires_at (nullable), issued_by_user_id (nullable), created_at, created_by',
+   'Rule Group 9: max_users/max_devices',
+   'Seat/licence governance.'),
+(72, 'Milestone 6 (Licences/Seats/Devices)', '07_licences.sql', 'seat_allocation',
+   'subscription_licence 1..* seat_allocation; users 1..* seat_allocation',
+   'id PK, subscription_licence_id FK, user_id FK, allocated_at, released_at (nullable), allocated_by_user_id (nullable)',
+   'Rule Group 9: seat allocation',
+   'Active seat counting.'),
+(73, 'Milestone 6 (Licences/Seats/Devices)', '07_licences.sql', 'device_registration',
+   'users 1..* device_registration; tenant_account 1..* device_registration (via user)',
+   'id PK, user_id FK, device_idempotency, device_display_name, last_seen_at, created_at, created_by, updated_at, updated_by',
+   'Rule Group 9: device registry',
+   'Device-level identity.'),
+(74, 'Milestone 6 (Licences/Seats/Devices)', '07_licences.sql', 'device_session',
+   'device_registration 1..* device_session; users 1..* device_session',
+   'id PK, device_registration_id FK, user_id FK, session_token_hash, logged_in_at, last_activity_at, logged_out_at (nullable), created_at, created_by',
+   'Rule Group 9: device sessions',
+   'Session counting per device.'),
+(75, 'Milestone 6 (Licences/Seats/Devices)', '07_licences.sql', 'login_history',
+   'users 1..* login_history; device_registration 1..* login_history (nullable)',
+   'id PK, user_id FK, device_registration_id FK (nullable), login_at, ip_address, user_agent, success, created_at',
+   'Login audit',
+   'Login analytics + security.'),
+(76, 'Milestone 6 (Licences/Seats/Devices)', '07_licences.sql', 'session_revocation_event',
+   'users 1..* session_revocation_event',
+   'id PK, user_id FK, revoked_session_token_hash (nullable), revoked_device_id (nullable), revoked_at, revoked_by_user_id (nullable), reason_code, created_at, created_by',
+   'Rule Group 9: revocation audit',
+   'Auditable session revocation.'),
+
+-- Milestone 7: Sourcing & Consultant
+(77, 'Milestone 7 (Sourcing & Consultant)', '08_sourcing.sql', 'sourcing_request',
+   'employer_organisation 1..* sourcing_request; job_requirement 1..* sourcing_request',
+   'id PK, employer_organisation_id FK, job_requirement_id FK, request_type_code, status_code, assigned_consultant_user_id (nullable), created_at, created_by, updated_at, updated_by',
+   'Sourcing request',
+   'Consultant assignment.'),
+(78, 'Milestone 7 (Sourcing & Consultant)', '08_sourcing.sql', 'consultant_decision',
+   'sourcing_request 1..* consultant_decision; users 1..* consultant_decision (consultant)',
+   'id PK, sourcing_request_id FK, consultant_user_id FK, decision_code, decision_text, decided_at, created_at, created_by',
+   'B46 consultant-only-on-open-requirements',
+   'Decision captured only for open requirements.'),
+(79, 'Milestone 7 (Sourcing & Consultant)', '08_sourcing.sql', 'sourcing_shortlist',
+   'sourcing_request 1..* sourcing_shortlist; candidate_identity 1..* sourcing_shortlist',
+   'id PK, sourcing_request_id FK, candidate_id FK, shortlist_order, added_by_user_id (nullable), added_at, removed_at (nullable), created_at, created_by',
+   'B37 referencing shortlist',
+   'Shortlist tied to sourcing request.'),
+(80, 'Milestone 7 (Sourcing & Consultant)', '08_sourcing.sql', 'outreach_batch',
+   'sourcing_request 1..* outreach_batch; users 1..* outreach_batch (owner)',
+   'id PK, sourcing_request_id FK, owner_user_id FK, batch_name, channel_code, status_code, scheduled_at (nullable), completed_at (nullable), created_at, created_by',
+   'Outreach batch',
+   'Outbound outreach grouping.'),
+(81, 'Milestone 7 (Sourcing & Consultant)', '08_sourcing.sql', 'outreach_batch_recipient',
+   'outreach_batch 1..* outreach_batch_recipient; candidate_identity 1..* outreach_batch_recipient',
+   'id PK, outreach_batch_id FK, candidate_id FK, outreach_status_code, contacted_at (nullable), replied_at (nullable), created_at, created_by',
+   'Outreach recipients',
+   'Per-candidate outreach tracking.'),
+
+-- Milestone 8: Subscriptions / Wallet / Payments / Download History
+(82, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'subscription_plan',
+   'subscription_plan 1..* plan_entitlement; subscription_plan 1..* subscription_period (template) (if needed)',
+   'id PK, plan_code, name, description, price, currency_code, billing_period_code, is_active, created_at, created_by, updated_at, updated_by',
+   'Rule Group 10 subscriptions',
+   'Catalog of plans.'),
+(83, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'plan_entitlement',
+   'subscription_plan 1..* plan_entitlement',
+   'id PK, subscription_plan_id FK, entitlement_code, entitlement_value, created_at, created_by',
+   'Rule Group 10 entitlements',
+   'Feature/limit entitlements.'),
+(84, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'subscription_period',
+   'tenant_account 1..* subscription_period; subscription_plan 1..* subscription_period',
+   'id PK, tenant_account_id FK, subscription_plan_id FK, period_start, period_end, status_code, created_at, created_by, updated_at, updated_by',
+   'Rule Group 10 non-overlapping periods',
+   'Non-overlapping subscription windows.'),
+(85, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'payment_order',
+   'tenant_account 1..* payment_order; subscription_period 1..* payment_order (nullable)',
+   'id PK, tenant_account_id FK, subscription_period_id FK (nullable), order_number, amount, currency_code, status_code, created_at, created_by, updated_at, updated_by',
+   'Rule Group 10 payments',
+   'Payment order.'),
+(86, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'payment_status_history',
+   'payment_order 1..* payment_status_history; users 1..* payment_status_history (actor, nullable)',
+   'id PK, payment_order_id FK, actor_user_id FK (nullable), status_code, occurred_at, detail (nullable), created_at',
+   'Rule Group 10 status history',
+   'Append-only payment status.'),
+(87, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'invoice',
+   'payment_order 1..* invoice',
+   'id PK, payment_order_id FK, invoice_number, issue_date, due_date, amount, currency_code, status_code, created_at, created_by',
+   'Rule Group 10 invoices',
+   ''),
+(88, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'refund',
+   'payment_order 1..* refund; invoice 1..* refund (nullable)',
+   'id PK, payment_order_id FK, invoice_id FK (nullable), refund_amount, currency_code, reason_text, status_code, created_at, created_by',
+   'Rule Group 10 refunds (correction references original)',
+   'Correction references original order.'),
+(89, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'wallet',
+   'tenant_account 1..* wallet',
+   'id PK, tenant_account_id FK, current_balance, currency_code, created_at, created_by, updated_at, updated_by',
+   'Rule Group 10 wallet',
+   'Wallet anchor.'),
+(90, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'wallet_ledger_entry',
+   'wallet 1..* wallet_ledger_entry; users 1..* wallet_ledger_entry (actor, nullable)',
+   'id PK, wallet_id FK, actor_user_id FK (nullable), credit_amount, debit_amount, balance_after, source_code, reference_id (nullable), created_at, created_by',
+   'Rule Group 10 append-only ledger',
+   'Append-only ledger with balance_after.'),
+(91, 'Milestone 8 (Subscriptions/Wallet/Payments)', '09_subscriptions.sql', 'profile_download_history',
+   'profile_download_history 1..* (viewed_by users); candidate_identity 1..* profile_download_history (subject)',
+   'id PK, downloaded_by_user_id FK, candidate_id FK, download_reason_code, download_timestamp, credit_deducted_amount, currency_code, created_at',
+   'Rule Group 10 download/view history append-only + credit',
+   'Append-only download history with credit deduction.'),
+
+-- Milestone 9: Notifications / Preferences / Community
+(92, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'notification_preference',
+   'users 1..* notification_preference; candidate_identity 1..* notification_preference (candidate)',
+   'id PK, user_id FK (nullable), candidate_id FK (nullable), channel_code, event_type_code, is_enabled, created_at, created_by, updated_at, updated_by',
+   'B57 preference model',
+   'User/preference pairs.'),
+(93, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'job_alert_preference',
+   'candidate_identity 1..* job_alert_preference',
+   'id PK, candidate_id FK, trigger_criteria_json, is_active, created_at, created_by, updated_at, updated_by',
+   'B57 job alerts',
+   'Job alert criteria.'),
+(94, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'language_preference',
+   'candidate_identity 1..* language_preference; language_lookup 1..* language_preference (via language_id)',
+   'id PK, candidate_id FK, language_id FK, is_default, created_at, created_by, updated_at, updated_by',
+   'Rule Group 7 multilingual',
+   'Multilingual preference.'),
+(95, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'privacy_setting',
+   'candidate_identity 1..* privacy_setting',
+   'id PK, candidate_id FK, scope_code, setting_key, setting_value, created_at, created_by, updated_at, updated_by',
+   'Privacy',
+   ''),
+(96, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'notification_delivery',
+   'notification_preference 1..* notification_delivery (via event_type/channel); users 1..* notification_delivery (recipient, nullable)',
+   'id PK, recipient_user_id FK (nullable), recipient_candidate_id FK (nullable), event_type_code, channel_code, payload_ref, status_code, scheduled_at (nullable), delivered_at (nullable), created_at, created_by',
+   'B57 high-volume delivery write path',
+   'High-volume delivery write path.'),
+(97, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'community_post',
+   'users 1..* community_post (author); community_post 1..* community_post_reaction',
+   'id PK, author_user_id FK, title, body, community_type_code, visibility_code, created_at, created_by, updated_at, updated_by',
+   'Community content',
+   'Community posts (Tier 2).'),
+(98, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'community_post_reaction',
+   'community_post 1..* community_post_reaction; users 1..* community_post_reaction',
+   'id PK, community_post_id FK, reacting_user_id FK, reaction_type_code, created_at',
+   'Reactions',
+   ''),
+(99, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'support_ticket',
+   'users 1..* support_ticket (requester); support_ticket 1..* support_ticket_reply',
+   'id PK, requester_user_id FK, subject, description, status_code, priority_code, created_at, created_by, updated_at, updated_by',
+   'Support',
+   ''),
+(100, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'support_ticket_reply',
+   'support_ticket 1..* support_ticket_reply; users 1..* support_ticket_reply (replier)',
+   'id PK, support_ticket_id FK, replier_user_id FK (nullable), reply_text, created_at, created_by',
+   'Ticket replies',
+   ''),
+(101, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'faq',
+   'faq_category 1..* faq; language_lookup 1..* faq (via language_id)',
+   'id PK, faq_category_id FK, language_id FK, question_key, answer_text, is_active, created_at, created_by, updated_at, updated_by',
+   'FAQ multilingual',
+   ''),
+(102, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'faq_category',
+   'faq_category 1..* faq',
+   'id PK, category_code, name, sort_order, is_active, created_at, created_by, updated_at, updated_by',
+   'FAQ categories',
+   ''),
+(103, 'Milestone 9 (Notifications/Prefs/Community)', '10_notifications.sql', 'referral_event',
+   'candidate_identity 1..* referral_event; users 1..* referral_event (referrer, nullable)',
+   'id PK, referrer_user_id FK (nullable), candidate_id FK, referral_type_code, event_data_json, created_at, created_by',
+   'Referral events',
+   'Tier 2 referral event log.'),
+
+-- Milestone 10: Analytics
+(104, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_dim_date',
+   'analytics_dim_date 1..* analytics_fact_*, analytics_agg_* (day grain)',
+   'id PK, date, day_of_week, week_of_year, month, quarter, year, is_current, created_at',
+   'B58 date dimension',
+   'Core date dimension.'),
+(105, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_dim_country',
+   'analytics_dim_country 1..* analytics_fact_*, analytics_agg_* (by country)',
+   'id PK, country_id FK?, country_code, country_name, is_active, created_at',
+   'B49 geography dim',
+   'Geography.'),
+(106, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_dim_city',
+   'analytics_dim_city 1..* analytics_fact_*, analytics_agg_* (by city)',
+   'id PK, city_id FK?, city_name, state_name, country_name, is_active, created_at',
+   'B49 geography dim',
+   'Geography.'),
+(107, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_dim_employer_organisation',
+   'analytics_dim_employer_organisation 1..* analytics_fact_*, analytics_agg_* (employer)',
+   'id PK, employer_organisation_id FK?, organisation_code, organisation_name, industry_code (nullable), is_active, created_at',
+   'B49 employer dim',
+   'Employer dimension.'),
+(108, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_dim_candidate',
+   'analytics_dim_candidate 1..* analytics_fact_*, analytics_agg_* (candidate)',
+   'id PK, candidate_id FK?, candidate_status_code, created_at_range_bucket, is_active, created_at',
+   'B49 candidate dim',
+   'Candidate dimension.'),
+(109, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_dim_job_requirement',
+   'analytics_dim_job_requirement 1..* analytics_fact_*, analytics_agg_* (job)',
+   'id PK, job_requirement_id FK?, job_code, job_title, employer_organisation_id FK?, status_code, created_at_bucket, is_active, created_at',
+   'B49 job dim',
+   'Job dimension.'),
+(110, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_dim_application_pipeline',
+   'analytics_dim_application_pipeline 1..* analytics_fact_application_pipeline; analytics_agg_pipeline_summary *',
+   'id PK, stage_code, stage_order, is_terminal, created_at',
+   'B58 SCD + aggregate refresh',
+   'Application stage dimension.'),
+(111, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_fact_application_pipeline',
+   'candidate_dim 1..* fact; job_dim 1..* fact; stage_dim 1..* fact; date_dim 1..* fact',
+   'id PK, candidate_id FK, job_requirement_id FK, stage_code FK, entered_at, exited_at (nullable), duration_hours, date_key, created_at, created_by',
+   'KPI: pipeline conversion',
+   'Stage time + conversion.'),
+(112, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_agg_pipeline_summary',
+   'analytics_dim_date / employer_dim / job_dim / stage_dim -> aggregate',
+   'id PK, month_key, employer_organisation_id FK?, job_requirement_id FK?, stage_code, applications_count, conversion_pct, avg_days_in_stage, last_refreshed_at',
+   'B58 aggregate refresh rules',
+   'Aggregate table.'),
+(113, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_agg_dashboard_summary',
+   'analytics_dim_date / employer_dim / candidate_dim -> aggregate',
+   'id PK, dashboard_key, month_key, candidate_signups, job_postings, applications, placements, last_refreshed_at',
+   'Tier 3 stretch: dashboard aggregates',
+   'Dashboard aggregate.'),
+(114, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_fact_skill_affinity',
+   'candidate_dim 1..* fact; date_dim 1..* fact',
+   'id PK, candidate_id FK, overall_affinity, top_skill_count, date_key, created_at, created_by',
+   'Unique skill-affinity KPI',
+   'Unique analytics fact for skill affinity.'),
+(115, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_fact_application_denial',
+   'candidate_dim 1..* fact; job_dim 1..* fact; employer_dim 1..* fact; date_dim 1..* fact',
+   'id PK, application_id FK, candidate_id FK, job_requirement_id FK, employer_organisation_id FK, stage_code, denial_code, date_key, created_at, created_by',
+   'Unique denial KPI',
+   'Unique analytics fact for denial funnel.'),
+(116, 'Milestone 10 (Analytics)', '11_analytics.sql', 'analytics_agg_denial_by_stage',
+   'analytics_fact_application_denial -> materialized view',
+   'month_key, stage_code, denial_code, denial_count, distinct_applications',
+   'Unique denial aggregate',
+   'Unique: denial aggregate by stage (nightly refresh).'),
+
+-- Milestone 11: Shared Team Items (Administration lock-in)
+(117, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'users',
+   'users 1..* audit_event; users 1..* credential_verification; users 1..* credential_recovery; users 1..* role_assignment; users 1..* permission_assignment; users 1..* session_record; users 1..* consent_record; users 1..* blocking_list (both sides); users 1..* candidate_identity (nullable); users 1..* profile_view_history; users 1..* candidate_shortlist_entry; users 1..* referral_tracking; users 1..* application_pipeline_event; users 1..* candidate_activity_log; users 1..* community_post; users 1..* community_post_reaction; users 1..* support_ticket; users 1..* support_ticket_reply; users 1..* faq; users 1..* referral_event; users 1..* notification_delivery; users 1..* wallet_ledger_entry; users 1..* outreach_batch; users 1..* outreach_batch_recipient; users 1..* gig_assignment; users 1..* gig_rating (rating_by, nullable); users 1..* gig_blacklist (added_by); users 1..* gig_favourite; users 1..* device_registration; users 1..* device_session; users 1..* login_history; users 1..* session_revocation_event; users 1..* password_policy (created_by/updated_by); users 1..* account_security_policy (created_by/updated_by)',
+   'id PK, tenant_account_id FK, username, email, password_hash, status_code, role_code, last_login_at, failed_login_count, created_at, created_by, updated_at, updated_by, deleted_at',
+   'Shared team identity',
+   'Central user identity.'),
+(118, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'credential_verification',
+   'users 1..* credential_verification',
+   'id PK, user_id FK, verification_channel_code, verification_token_ref, token_expires_at, attempts_count, status_code, verified_at (nullable), created_at, created_by',
+   'Unique best-practice credential verification',
+   'Unique: verification separated from password.'),
+(119, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'credential_recovery',
+   'users 1..* credential_recovery',
+   'id PK, user_id FK, recovery_token_ref, token_expires_at, used_at (nullable), status_code, created_at, created_by',
+   'Unique best-practice credential recovery',
+   'Unique: separate recovery store.'),
+(120, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'role_lookup',
+   'role_lookup 1..* role_assignment; role_lookup 1..* permission (via role_permission)',
+   'id PK, role_code, name, description, created_at, created_by',
+   'Role master',
+   'Reserved-name issue: table is role_lookup.'),
+(121, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'role_assignment',
+   'users 1..* role_assignment; role_lookup 1..* role_assignment',
+   'id PK, user_id FK, role_code FK, assigned_by_user_id (nullable), effective_from, effective_to (nullable), is_active, created_at, created_by',
+   'Role assignment',
+   'Effective-dated role assignment.'),
+(122, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'permission',
+   'permission 1..* permission_assignment',
+   'id PK, permission_code, description, created_at, created_by',
+   'Permission master',
+   ''),
+(123, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'permission_assignment',
+   'role_lookup 1..* permission_assignment; permission 1..* permission_assignment',
+   'id PK, role_code FK, permission_code FK, created_at, created_by',
+   'Permission grant',
+   'Role -> permission mapping.'),
+(124, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'session_record',
+   'users 1..* session_record',
+   'id PK, user_id FK, session_token_hash, started_at, last_active_at, ended_at (nullable), ip_address, user_agent, created_at, created_by',
+   'Session lifecycle',
+   'Session audit.'),
+(125, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'consent_record',
+   'users 1..* consent_record; candidate_identity 1..* consent_record (nullable)',
+   'id PK, user_id FK, candidate_id FK (nullable), consent_type_code, consent_status_code, version_text (nullable), recorded_at, recorded_by_user_id (nullable), ip_address (nullable), created_at, created_by',
+   'Consent lifecycle',
+   'Consent record for compliance.'),
+(126, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'audit_event',
+   'users 1..* audit_event (actor); users 1..* audit_event (affected_user_id, nullable)',
+   'id PK, actor_user_id FK, action_code, object_type, object_id (nullable), detail_json (nullable), occurred_at, created_at, created_by',
+   'Audit trail',
+   'Append-only audit.'),
+(127, 'Milestone 11 (Shared Team Items)', '04_administration.sql', 'blocking_list',
+   'users 1..* blocking_list (blocker); users 1..* blocking_list (blocked)',
+   'id PK, blocker_user_id FK, blocked_user_id FK, block_reason_code, blocked_at, unblocked_at (nullable), created_at, created_by',
+   'B59 block rule',
+   'Blocking list (shared team item).'),
+
+-- Milestone 12: Tier 3 stretch
+(128, 'Milestone 12 (Tier 3 stretch)', '12_tier3_stretch.sql', 'salary_benchmark',
+   'industry 1..* salary_benchmark (industry); job_role 1..* salary_benchmark (role); employer_organisation 1..* salary_benchmark (employer, nullable)',
+   'id PK, industry_id FK (nullable), job_role_id FK (nullable), employer_organisation_id FK (nullable), role_code (nullable), geography_code (nullable), min_salary, max_salary, currency_code, sample_size, as_of_date, created_at, created_by',
+   'Unique salary benchmarks',
+   'Unique Tier 3: salary benchmarks.'),
+(129, 'Milestone 12 (Tier 3 stretch)', '12_tier3_stretch.sql', 'company_rating',
+   'employer_organisation 1..* company_rating; users 1..* company_rating (rated_by)',
+   'id PK, employer_organisation_id FK, rated_by_user_id FK (nullable), rating_value, category_code, comment_text, created_at, created_by',
+   'Unique company ratings',
+   'Unique Tier 3: company ratings.'),
+(130, 'Milestone 12 (Tier 3 stretch)', '12_tier3_stretch.sql', 'trending_job_snapshot',
+   'job_requirement 1..* trending_job_snapshot',
+   'id PK, job_requirement_id FK, snapshot_date, view_count, application_count, shortlist_count, active_offer_count, is_trending, created_at, created_by',
+   'Unique trending job snapshots',
+   'Unique Tier 3: trending snapshots.'),
+(131, 'Milestone 12 (Tier 3 stretch)', '12_tier3_stretch.sql', 'dashboard_metadata',
+   'dashboard_metadata 1..* dashboard_widget (owner)',
+   'id PK, dashboard_key, title, refresh_interval_minutes, created_at, created_by, updated_at, updated_by',
+   'Unique dashboard config',
+   'Unique Tier 3: dashboard metadata.'),
+(132, 'Milestone 12 (Tier 3 stretch)', '12_tier3_stretch.sql', 'dashboard_widget',
+   'dashboard_metadata 1..* dashboard_widget',
+   'id PK, dashboard_metadata_id FK, widget_key, widget_type_code, config_json, last_rendered_at (nullable), created_at, created_by, updated_at, updated_by',
+   'Unique dashboard widgets',
+   'Unique Tier 3: dashboard widgets.'),
+(133, 'Milestone 12 (Tier 3 stretch)', '12_tier3_stretch.sql', 'feature_flag',
+   'feature_flag 1..* feature_flag_target (tenant)',
+   'id PK, flag_key, flag_value, scope_code, tenant_account_id FK (nullable), candidate_identity_id FK (nullable), effective_from, effective_to (nullable), created_at, created_by, updated_at, updated_by',
+   'Unique feature flags',
+   'Unique Tier 3: feature flags.'),
+
+-- Closing note
+(999, 'Post-schema', '99_documentation.sql', 'integration_boundaries',
+   'Each module has an integration boundary (external systems, shared nothing except documented APIs/IDs)',
+   'See Section 6 table in 99_documentation.sql',
+   'Section 6 integration boundaries',
+   'No out-of-docket integrations.'),
+(1000, 'Post-schema', '99_documentation.sql', 'deviation_register',
+   'Rule Group 1-10 compliance register records every deviation reason',
+   'See Rule Group 1-10 register in 99_documentation.sql',
+   'Compliance register',
+   'No undocumented deviations.');
+
+-- ============================================================================
+-- SECTION: MILESTONE-ORDER ENTITIES -> RELATIONSHIPS -> COLUMNS (CONTEXT MENU)
+-- ============================================================================
+-- Approach: entities first, then cardinality between entities, then key columns,
+-- in the docket milestone order. This is the "context menu" for the schema:
+--   * Milestone 1 (Common): start at Master Data / Administration / Profile
+--   * Milestone 2 (Candidate Profile): 02_profile.sql
+--   * Milestone 3 (Employer / Org): 05_organisation.sql
+--   * Milestone 4 (Jobs & Applications): 03_jobs_applications.sql
+--   * Milestone 5 (Gig Marketplace): 06_gig_marketplace.sql
+--   * Milestone 6 (Licences/Seats/Devices): 07_licences.sql
+--   * Milestone 7 (Sourcing & Consultant): 08_sourcing.sql
+--   * Milestone 8 (Subscriptions/Wallet): 09_subscriptions.sql
+--   * Milestone 9 (Notifications/Prefs/Community): 10_notifications.sql
+--   * Milestone 10 (Analytics): 11_analytics.sql
+--   * Milestone 11 (Shared Team Items): 04_administration.sql (blocking, audit, consent, sessions)
+--   * Milestone 12 (Tier 3 stretch): 12_tier3_stretch.sql
+--
+-- Read order for implementation: Domain table -> extension table -> transaction table -> audit/history.
+
+-- (duplicate map block removed)
