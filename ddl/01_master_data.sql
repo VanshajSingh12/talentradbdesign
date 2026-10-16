@@ -164,8 +164,8 @@ CREATE TABLE qualification (
     updated_by             BIGINT   NOT NULL DEFAULT 0,
     CONSTRAINT uq_qualification_code UNIQUE (code),
     CONSTRAINT uq_qualification_name_active UNIQUE (name, is_active),
-    CONSTRAINT fk_qualification_education_level FOREIGN KEY (education_level_code, 'education_level')
-        REFERENCES reference_code(domain, code) ON DELETE RESTRICT ON UPDATE CASCADE
+    CONSTRAINT fk_qualification_education_level FOREIGN KEY (education_level_code)
+        REFERENCES reference_code(code) ON DELETE RESTRICT ON UPDATE CASCADE
 );
 
 CREATE INDEX idx_qualification_education_level ON qualification (education_level_code);
@@ -304,7 +304,8 @@ CREATE TABLE reference_code (
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_by         BIGINT   NOT NULL DEFAULT 0,
     CONSTRAINT uq_reference_code_domain_code UNIQUE (domain, code),
-    CONSTRAINT uq_reference_code_display UNIQUE (domain, display_name_key)
+    CONSTRAINT uq_reference_code_display UNIQUE (domain, display_name_key),
+    CONSTRAINT uq_reference_code_code UNIQUE (code)
 );
 
 CREATE INDEX idx_reference_code_domain ON reference_code (domain);

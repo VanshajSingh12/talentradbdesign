@@ -356,9 +356,7 @@ CREATE TABLE resume_version (
     CONSTRAINT fk_resume_version_template FOREIGN KEY (template_id)
         REFERENCES resume_template(id) ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT chk_resume_version_language CHECK (
-        language IS NULL OR language IN (
-            SELECT language.name FROM language_lookup WHERE language.is_active = TRUE
-        )
+        language IS NULL OR char_length(language) > 0
     ),
     CONSTRAINT uq_resume_version_candidate_current UNIQUE (candidate_id, is_current)
 );

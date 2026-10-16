@@ -254,7 +254,7 @@ CREATE INDEX idx_device_session_user ON device_session (user_id);
 CREATE INDEX idx_device_session_device ON device_session (device_registration_id);
 CREATE INDEX idx_device_session_token_ref ON device_session (session_token_ref);
 CREATE INDEX idx_device_session_active ON device_session (user_id, device_registration_id, is_revoked, ended_at, expires_at)
-    WHERE is_revoked = FALSE AND ended_at IS NULL AND expires_at > now();
+    WHERE is_revoked = FALSE AND ended_at IS NULL;
 CREATE INDEX idx_device_session_started_at ON device_session (started_at);
 CREATE INDEX idx_device_session_deleted ON device_session (deleted_at) WHERE deleted_at IS NOT NULL;
 

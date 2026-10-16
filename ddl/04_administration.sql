@@ -368,7 +368,7 @@ CREATE TABLE session_record (
 CREATE INDEX idx_session_record_user ON session_record (user_id);
 CREATE INDEX idx_session_record_token_ref ON session_record (session_token_ref);
 CREATE INDEX idx_session_record_active ON session_record (user_id, is_revoked, ended_at, expires_at)
-    WHERE is_revoked = FALSE AND ended_at IS NULL AND expires_at > now();
+    WHERE is_revoked = FALSE AND ended_at IS NULL;
 CREATE INDEX idx_session_record_started_at ON session_record (started_at);
 CREATE INDEX idx_session_record_deleted ON session_record (deleted_at) WHERE deleted_at IS NOT NULL;
 

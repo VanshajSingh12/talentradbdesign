@@ -163,7 +163,7 @@ CREATE TABLE sourcing_shortlist (
     CONSTRAINT fk_sourcing_shortlist_request FOREIGN KEY (sourcing_request_id)
         REFERENCES sourcing_request(id) ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT fk_sourcing_shortlist_shortlist FOREIGN KEY (shortlist_id)
-        REFERENCES shortlist(id) ON DELETE CASCADE ON UPDATE CASCADE,
+        REFERENCES candidate_shortlist_entry(id) ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT uq_sourcing_shortlist_request UNIQUE (sourcing_request_id)
 );
 
@@ -265,9 +265,10 @@ CREATE TABLE outreach_batch_recipient (
         REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT chk_outreach_batch_recipient_contact CHECK (
         candidate_identity_id IS NOT NULL OR recipient_user_id IS NOT NULL
-    ),
-    CONSTRAINT uq_outreach_batch_recipient_batch_contact UNIQUE (outreach_batch_id, contact_channel_code, COALESCE(candidate_identity_id, recipient_user_id))
+    )
 );
+
+CREATE UNIQUE INDEX uq_outreach_batch_recipient_batch_contact ON outreach_batch_recipient (outreach_batch_id, contact_channel_code, COALESCE(candidate_identity_id, recipient_user_id));
 
 CREATE INDEX idx_outreach_batch_recipient_batch ON outreach_batch_recipient (outreach_batch_id);
 CREATE INDEX idx_outreach_batch_recipient_candidate ON outreach_batch_recipient (candidate_identity_id) WHERE candidate_identity_id IS NOT NULL;

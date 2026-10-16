@@ -164,7 +164,7 @@ def main():
     work_types = load_table_ids("work_type", id_col="id", name_col="code")
     work_type_codes = [w[1] for w in work_types]
 
-    languages = load_table_ids("language", id_col="id", name_col="name")
+    languages = load_table_ids("language_lookup", id_col="id", name_col="name")
     language_names = [l[1] for l in languages]
 
     ref_codes = {}
@@ -415,11 +415,12 @@ def main():
         contact_type_code = random.choice(list(ref_codes["contact_type"].keys()))
         phone = nullable_choice(None, 0.2) or f"+{random.randint(1,999)} {random.randint(100,999)} {random.randint(100,999)} {random.randint(1000,9999)}"
         # E.164-ish: just produce something that passes the regex loosely; we won't enforce regex in seed
-        country_code = nullable_choice(random.choice([c[0] for c in countries])[:2] if countries else None, 0.1)
+        country_code = nullable_choice(random.choice([c[0] for c in countries]) if countries else None, 0.1)
         address_line1 = nullable_choice(fk.street_address()[:200], 0.3)
-        address_line2 = nullable_choice(fk.secondary_address()[:200], 0.4)
-        city_name = nullable_choice(random.choice(cities_by_country[random.choice(countries)[0]][1] if countries and cities_by_country.get(random.choice(countries)[0]) else None), 0.2)
-        state_name = nullable_choice(random.choice(states_by_country[random.choice(countries)[0]][1] if countries and states_by_country.get(random.choice(countries)[0]) else None), 0.2)
+        address_line2 = nullable_choice(fk.secondary_address()[:200] if hasattr(fk, "secondary_address") else fk.building_number()[:200] if hasattr(fk, "building_number") else None, 0.4)
+        _city_country = random.choice([c[0] for c in countries]) if countries else None
+        city_name = nullable_choice(random.choice(cities_by_country[_city_country])[1] if countries and _city_country and cities_by_country.get(_city_country) else None, 0.2)
+        state_name = nullable_choice(random.choice(states_by_country[_city_country])[1] if countries and _city_country and states_by_country.get(_city_country) else None, 0.2)
         country_name = random.choice(countries)[1] if countries else None
         postal_code = nullable_choice(fk.postcode()[:20], 0.3)
         is_primary = True
@@ -448,13 +449,13 @@ def main():
         n_edu = random.randint(0, 4)
         for _ in range(n_edu):
             inst = fk.company()[:200] if hasattr(fk, "company") else fk.company_name()[:200]
-            qual = nullable_choice(random.choice(qualifications_names()), 0.25)
+            qual = nullable_choice(random.choice(qualifications_names), 0.25)
             field = fk.job()[:200] if hasattr(fk, "job") else fk.job_name()[:200]
             start = nullable_date(0.2)
             end = nullable_date(0.3) if not (start and random.random() < 0.3) else None
             is_current = random.choice([True, False]) if start else False
             grad_pct = nullable_choice(round(random.uniform(50, 100), 2), 0.25)
-            inst_type = nullable_choice(random.choice(list(ref_codes["institution_type"].keys()) if ref_codes.get("institution_type") else None), 0.25)
+            inst_type = nullable_choice(random.choice(list(ref_codes["institution_type"].keys())) if ref_codes.get("institution_type") else None, 0.25) if ref_codes.get("institution_type") else None
             notes = nullable_choice(fk.text(max_nb_chars=200)[:500], 0.4)
             candidate_education_inserts.append((qual, inst_type, inst, field, start, end, is_current, grad_pct, notes))
 
@@ -579,7 +580,7 @@ def main():
         # referral_tracking: 0..2 rows
         n_ref = random.randint(0, 2)
         for _ in range(n_ref):
-            rtype = random.choice(referral_types())
+            rtype = nullable_choice(random.choice(referral_types()) if referral_types() else None)
             status = random.choice(referral_statuses())
             referred_email = nullable_choice(fk.email().lower(), 0.3)
             ref_job_title = nullable_choice(fk.job()[:200], 0.3)
